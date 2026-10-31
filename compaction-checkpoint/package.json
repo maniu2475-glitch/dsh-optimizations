@@ -1,0 +1,12 @@
+{
+  "name": "@local/dsh-compaction-checkpoint",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Checkpoint upgrade for DSH auto-compaction: stricter validated summary template (verified results, failed attempts, evidence markers, superseded requirements, do-not-repeat).",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./template": "./template.js"
+  }
+}
