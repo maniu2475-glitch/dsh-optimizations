@@ -83,6 +83,132 @@ export const EVIDENCE_MARKERS = ['[fact]', '[speculation]', '[unverified]']
 export const SUMMARY_OPEN_TAG = '<compacted-summary>'
 export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 
+/**
+ * Rewrite a bullet's leading marker into the accepted set.
+ *
+ * Models routinely emit a retired marker ([verified]/[claimed]) or, after the
+ * instruction tells them to repeat the marker on every line, repeat it on an
+ * empty body line. Both are repaired here rather than rejected: the retired
+ * marker becomes `[unverified]` (the claim carries no accepted evidence
+ * marker, so that classification is the truthful one), and a marker repeated
+ * on an otherwise-empty line is dropped so the line cannot be mistaken for a
+ * bullet with filler body.
+ *
+ * @param {string} bullet - bullet text with the list dash removed.
+ * @returns {string} bullet text with an accepted marker, or the input unchanged.
+ */
+function normalizeBullet(bullet) {
+  let text = String(bullet ?? '')
+  // Fold every retired alias into the honest fallback marker.
+  for (const alias of MARKER_ALIASES) {
+    while (text.toLowerCase().startsWith(alias)) {
+      text = `[unverified]${text.slice(alias.length)}`
+    }
+  }
+  // Collapse a leading run of accepted markers down to the first one.
+  for (const marker of EVIDENCE_MARKERS) {
+    if (!text.startsWith(marker)) continue
+    let rest = text.slice(marker.length)
+    while (rest.trimStart().startsWith(marker)) rest = rest.trimStart().slice(marker.length)
+    text = `${marker}${rest}`
+    break
+  }
+  return text
+}
+
+/**
+ * Render a parsed checkpoint back to the canonical bullet form that the
+ * validator accepts, so a structurally sound summary is never discarded over
+ * marker spelling.
+ *
+ * This only rewrites the marker prefix of each bullet (and re-adds a missing
+ * dash). Section order, headings, and every word of content are preserved; a
+ * body that is prose rather than bullets is left untouched, because no rewrite
+ * could make it a checkpoint without inventing structure.
+ *
+ * @param {string} text - candidate summary text.
+ * @returns {string} text with canonical bullet markers.
+ */
+export function canonicalizeSummary(text) {
+  const lines = String(text ?? '').split('\n')
+  const out = []
+  let inFence = false
+  for (const line of lines) {
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      inFence = !inFence
+      out.push(line)
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      continue
+    }
+    const match = /^(\s*)(?:[-*]\s+)?(.*)$/.exec(line)
+    const indent = match[1]
+    const body = match[2]
+    if (body.trim().length === 0) {
+      out.push(line)
+      continue
+    }
+    const normalized = normalizeBullet(body)
+    const marker = EVIDENCE_MARKERS.find((m) => normalized.startsWith(m))
+    if (marker === undefined) {
+      out.push(line)
+      continue
+    }
+    out.push(`${indent}- ${normalized}`)
+  }
+  return out.join('\n')
+}
+
+/**
+ * Estimate the tokens a text costs on the request path.
+ *
+ * Deliberately conservative and language-aware: Latin text averages roughly
+ * four characters per token, while CJK text costs close to one token per
+ * character, so a pure length/4 estimate badly under-counts Chinese
+ * summaries. Erring high here keeps the plugin from accepting a checkpoint
+ * that the engine's own meter would later reject.
+ *
+ * @param {string} text - text to measure.
+ * @returns {number} estimated tokens.
+ */
+export function estimateTokens(text) {
+  const source = String(text ?? '')
+  let cjk = 0
+  for (const char of source) {
+    const code = char.codePointAt(0)
+    if ((code >= 0x2e80 && code <= 0x9fff)
+      || (code >= 0xac00 && code <= 0xd7af)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xff00 && code <= 0xffef)) cjk += 1
+  }
+  const latin = source.length - cjk
+  return Math.ceil(cjk + latin / 4)
+}
+
+/**
+ * Count the content characters of the span the engine is about to shadow.
+ *
+ * This is the same `input` the engine hands the summarizer, so the figure is
+ * measured over exactly the messages whose removal the checkpoint must
+ * compensate for (plus their framing, which is rounded up separately).
+ *
+ * @param {{messages?: Array<{content?: Array<{text?: string}>}>}} input - replayed span.
+ * @returns {{chars: number, tokens: number}} span size.
+ */
+export function spanSize(input) {
+  const chars = inputChars(input)
+  return { chars, tokens: Math.ceil(chars / 4) }
+}
+
+/**
+ * Marker prefixes a model reaches for when it forgets the exact marker set.
+ * They are not accepted as-is; they are REWRITTEN to `[unverified]`, which is
+ * the honest classification (the claim was not evidenced with a marker).
+ */
+const MARKER_ALIASES = ['[verified]', '[claimed]', '[unconfirmed]', '[verified fact]']
+
 /** Headings that look like work but are filler when they are all a section has. */
 const FILLER_BODY = /^(?:\(none\)|n\/?a|tbd|todo|待定|无|暂无|\?|-|—|none\.?)$/i
 
@@ -154,6 +280,9 @@ function checkSectionBody(section) {
     return `${section.heading}: no bullet items (prose paragraphs are not checkpoints)`
   }
   for (const raw of bullets) {
+    // Strict on purpose: repairing a marker is `canonicalizeSummary`'s job,
+    // invoked explicitly by the caller, so the validator never silently
+    // accepts a retired or doubled marker on its own.
     const bullet = raw.trim().replace(/^[-*]\s+/, '')
     const marker = EVIDENCE_MARKERS.find((m) => bullet.startsWith(m))
     if (!marker) {
@@ -227,9 +356,14 @@ export function validateSummary(blocks, sourceChars) {
 /**
  * Build the checkpoint instruction.
  * @param {boolean} strict - true on the retry pass, to press harder on format.
+ * @param {{budgetChars?: number}} [options] - optional length budget, in characters
+ *   of summary text, derived from the span the checkpoint replaces.
  * @returns {string} instruction text appended as the final user message.
  */
-export function buildInstruction(strict) {
+export function buildInstruction(strict, options = {}) {
+  const budgetChars = Number.isFinite(options.budgetChars) && options.budgetChars > 0
+    ? Math.floor(options.budgetChars)
+    : undefined
   const lines = [
     'You are acting as a compaction engine for an AI coding agent session.',
     'Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.',
@@ -289,7 +423,13 @@ export function buildInstruction(strict) {
     '- When merging a prior checkpoint (a ' + SUMMARY_OPEN_TAG + ' block in the conversation), consolidate: keep still-true facts, CORRECT or DELETE stale conclusions, and merge newer information. The new summary REPLACES the old wholesale -- do not accumulate stale items, old verdicts, or ever-growing section lists across rounds.',
     '- Do NOT mention this summarization request, that the context was compacted, or that you are a summarizer. Output only the checkpoint.',
     '- Do NOT call any tool. Output nothing but the checkpoint text.',
+    '- BE TERSE. The checkpoint REPLACES the conversation span, so a checkpoint longer than what it replaces is rejected and wastes the whole compaction. One line per fact, no filler, no restating text that is already quoted elsewhere in the checkpoint.',
   ]
+  if (budgetChars !== undefined) {
+    lines.push(
+      `- LENGTH BUDGET: keep the whole checkpoint under ${budgetChars} characters. The material being replaced costs about 4 characters per token, and the replacement is measured the same way, so exceeding this budget makes the checkpoint strictly worse than doing nothing. When you run out of room, shorten wording -- never drop a section, and never drop a file path, command, error string, or explicit user cancellation.`,
+    )
+  }
   if (strict) {
     lines.push(
       '',
@@ -297,7 +437,13 @@ export function buildInstruction(strict) {
       `Required section headings, verbatim and in this order: ${ALL_SECTIONS.join(' | ')}.`,
       'Start your reply with "## Primary Request and Intent" and include every heading above exactly once.',
       `Open every bullet with exactly one of ${EVIDENCE_MARKERS.join('/')}. Key sections (${KEY_SECTIONS.join(', ')}) must carry real content, never a placeholder.`,
+      `A section with nothing to record takes exactly "${EMPTY_PLACEHOLDER}" as its whole body -- not a bullet, and never a marker in front of "${EMPTY_PLACEHOLDER}".`,
     )
+    if (budgetChars !== undefined) {
+      lines.push(
+        `Be shorter as well as well-formed: the whole checkpoint must stay under ${budgetChars} characters, or the engine rejects it as no shorter than the conversation it replaces.`,
+      )
+    }
   }
   return lines.join('\n')
 }

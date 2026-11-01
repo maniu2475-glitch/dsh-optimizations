@@ -384,3 +384,106 @@ test('the accept log says "candidate accepted", not "committed"', async () => {
   assert.ok(line, 'must log candidate accepted: ' + JSON.stringify(logs))
   assert.equal(logs.some(([, m]) => m.includes('committed')), false, 'plugin must not claim the engine commit')
 })
+
+// --- v2.2: span-size agency and engine-rejection cooldown -------------------
+
+/** An input small enough that any real checkpoint overshoots it. */
+function tinyInput() {
+  return { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], tools: undefined }
+}
+
+test('a checkpoint larger than the span is rejected here, not left to the engine', async () => {
+  // The engine throws "summary is not smaller than the shadowed content" AFTER
+  // summarize() resolves, which used to mean paying twice per compaction.
+  const { services, logs } = install({ config: { failureCooldownMs: 0, maxSummaryAttempts: 1 } })
+  services.llm.stream = fakeStream([
+    { type: 'text-delta', text: goodSummaryText() },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  await assert.rejects(
+    () => services.compaction.summarize(tinyInput(), baseAgent(), undefined),
+    (error) => error.code === ERROR_CODES.FORMAT,
+  )
+  const line = logs.find(([, m]) => m.includes('would not shrink the span'))
+  assert.ok(line, 'must explain the size rejection: ' + JSON.stringify(logs))
+  assert.match(line[1], /framed tokens/)
+})
+
+test('the instruction handed to the model carries a length budget', async () => {
+  const { services } = install({ config: { failureCooldownMs: 0 } })
+  let seen
+  services.llm.stream = async function* stream(options) {
+    seen = options.messages.at(-1).content[0].text
+    yield { type: 'text-delta', text: goodSummaryText() }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  await services.compaction.summarize(baseInput(), baseAgent(), undefined)
+  assert.match(seen, /LENGTH BUDGET/)
+})
+
+test('the retry attempt asks for a strictly smaller checkpoint', async () => {
+  const { services } = install({ config: { failureCooldownMs: 0 } })
+  const budgets = []
+  let call = 0
+  services.llm.stream = async function* stream(options) {
+    const text = options.messages.at(-1).content[0].text
+    const match = /under (\d+) characters/.exec(text)
+    if (match) budgets.push(Number(match[1]))
+    call += 1
+    yield {
+      type: 'text-delta',
+      text: call === 1 ? 'not a checkpoint at all' : goodSummaryText(),
+    }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  await services.compaction.summarize(baseInput(), baseAgent(), undefined)
+  assert.equal(budgets.length, 2)
+  assert.ok(budgets[1] < budgets[0], `retry budget ${budgets[1]} must be below ${budgets[0]}`)
+})
+
+test('a retired marker in the reply is repaired instead of costing a retry', async () => {
+  const { services } = install({ config: { failureCooldownMs: 0 } })
+  let calls = 0
+  services.llm.stream = async function* stream() {
+    calls += 1
+    yield { type: 'text-delta', text: goodSummaryText().replace('- [fact] real content item for ## Pending Jobs', '- [verified] real content item for ## Pending Jobs') }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const result = await services.compaction.summarize(baseInput(), baseAgent(), undefined)
+  assert.equal(calls, 1, 'repair must avoid the second provider call')
+  const text = result.summary.map((b) => b.text).join('')
+  assert.match(text, /\[unverified\] real content item/)
+  assert.doesNotMatch(text, /\[verified\]/)
+})
+
+test('the engine size rejection marks the next turn as cooling down', async () => {
+  // Reproduces the real gap: the plugin accepted, the engine threw afterwards,
+  // and the cooldown map never learned about it.
+  const { services } = install({ config: { failureCooldownMs: 60000 } })
+  let calls = 0
+  services.llm.stream = async function* stream() {
+    calls += 1
+    yield { type: 'text-delta', text: goodSummaryText() }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+  const pending = services.compaction.summarize(baseInput(), baseAgent(), undefined)
+  await pending
+  // The engine's own gate runs after our hook resolves.
+  const error = new Error('summary is not smaller than the shadowed content (900 estimated framed tokens >= 800)')
+  assert.equal(pending.checkpointObserve(error), true)
+  // The cooldown guard throws synchronously on the next turn, before any
+  // provider call is issued.
+  assert.throws(
+    () => services.compaction.summarize(baseInput(), baseAgent(), undefined),
+    (err) => err.code === ERROR_CODES.COOLDOWN,
+  )
+  assert.equal(calls, 1, 'the cooling turn must not reach the provider')
+})
+
+test('observe ignores unrelated engine errors', () => {
+  const { services } = install({ config: {} })
+  services.llm.stream = fakeStream([])
+  const pending = services.compaction.summarize(baseInput(), baseAgent(), undefined)
+  pending.catch(() => {})
+  assert.equal(pending.checkpointObserve(new Error('session surface changed during summarization')), false)
+})

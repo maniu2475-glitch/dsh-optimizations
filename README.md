@@ -1,11 +1,11 @@
-# DSH 优化实践集（DeepSeek Harness Optimizations）
+﻿# DSH 优化实践集（DeepSeek Harness Optimizations）
 
 > 面向 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai)用户的实战优化集合：一个增强自动上下文压缩的本地插件、一套经过 8 次真实运行验证的网页调研流水线编排规范、以及 4 份可直接挂载的个人 Agent 预设。全部成果均在 DSH 0.2.1-rc.5 上实测验收。
 
 ## 目录结构
 
 ```
-compaction-checkpoint/   # 自动上下文压缩增强插件（@local/dsh-compaction-checkpoint，v2）
+compaction-checkpoint/   # 自动上下文压缩增强插件（@local/dsh-compaction-checkpoint，v2.2）
 web-research-pipeline/   # 网页调研报告流水线 v2.5.1（模板 + 阶段语义 + 编排脚本）
 presets/                 # 4 份个人 Agent 预设（快速/全能执行/规划/协作集群）
 docs/                    # 使用说明与验收报告（含完整踩坑记录）
@@ -31,6 +31,28 @@ examples/                # 插件真实产出的压缩摘要样例
 - 失败冷却 60s/会话，拦截无效重试
 - 结构化校验器：标题恰好一次、按序、围栏不冒充、关键节反填充
 - 单测 39/39；headless 回归 13 次压缩全插件产物
+
+### v2.2 长度治理修复（2026-11-01，基于 123 个真实会话的失败统计）
+
+对全量会话日志的扫描发现：126 次压缩尝试中 **61 次失败**。修复前先复现、修复后复跑同一脚本
+（`compaction-checkpoint/test/repro-volume-gap.mjs`，9/9 通过）。
+
+| 失败类 | 真实次数 | 根因 | v2.2 修复 |
+| --- | --- | --- | --- |
+| `summary is not smaller than the shadowed content` | 26 | 指令要求 11 个必填节，却从不说结果必须**小于**被替换的内容。22 token 的区间被写成 683 token 的摘要；引擎在 `summarize()` **返回之后**才抛错，插件冷却感知不到，下一轮继续重烧两次请求 | 指令动态携带**长度预算**（被替换区间 token × 0.75，重试收紧到 0.6）；接受前插件先做体积预判，超限按 format 拒绝并给出可执行原因；`checkpointObserve()` 让引擎侧拒绝回流到冷却 |
+| 格式拒绝（退役 `[verified]` 标记、`(none)` 占位写法） | 10 | 校验器把拼写瑕疵当成结构错误，白白多花一次请求 | `canonicalizeSummary()` 把退役/重复标记改写成 `[unverified]`（诚实的降级分类）；严格校验器本身仍拒绝裸标记，改写是调用方的显式步骤 |
+| 冷却未命中 | 15 | 引擎抛错发生在插件 promise 已 resolve 之后 | 按轮次令牌区分"本轮记录"与"上轮遗留"，引擎拒绝现在真正计入冷却 |
+
+修复前后对照（同一脚本、同一输入）：
+
+| 检查项 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 结构合法但超大的检查点 | 接受 → 引擎随后抛错 | 插件自行拒绝并说明原因 |
+| 感知引擎侧拒绝 | 无此通道（`undefined`） | `checkpointObserve()` 返回 true |
+| 下一轮压缩 | 再次发出完整请求 | 冷却拦截，零请求 |
+| 指令含长度预算 | 否 | 是 |
+
+新增 14 项单测（**59/59 通过**），覆盖 CJK 友好的 token 估算、体积门控、预算收紧、标记改写与冷却回流。
 
 ### 安装
 

@@ -12,9 +12,12 @@ import {
   DO_NOT_REPEAT_SECTION,
   KEY_SECTIONS,
   buildInstruction,
+  canonicalizeSummary,
   cleanSummaryBlocks,
+  estimateTokens,
   inputChars,
   parseCheckpoint,
+  spanSize,
   validateSummary,
 } from '../template.js'
 
@@ -157,12 +160,29 @@ test('bullets without an evidence marker are rejected', () => {
   assert.match(verdict.reason, /without a leading evidence marker/)
 })
 
-test('retired [verified]/[claimed] markers are rejected', () => {
+test('retired [verified]/[claimed] markers are repaired to [unverified], not rejected', () => {
+  // v2.2: a retired alias is a spelling slip over a sound summary. The
+  // canonicalizer rewrites it, and [unverified] is the honest classification
+  // because the bullet carried no accepted evidence marker.
   const text = REQUIRED_SECTIONS
     .map((section) => `${section}\n- ${section === '## Completed and Verified' ? '[verified] done' : '[fact] item'}\n`)
     .join('\n')
     + `${DO_NOT_REPEAT_SECTION}\n- [fact] item\n`
-  const verdict = validateSummary([{ type: 'text', text }], 50000)
+  const repaired = canonicalizeSummary(text)
+  assert.match(repaired, /- \[unverified\] done/)
+  assert.doesNotMatch(repaired, /\[verified\]/)
+  const verdict = validateSummary([{ type: 'text', text: repaired }], 20000)
+  assert.equal(verdict.ok, true, verdict.reason)
+})
+
+test('a raw retired marker is still not accepted without repair', () => {
+  // The validator stays strict: repairing is the caller's explicit step, so a
+  // stale caller cannot silently slip a retired marker through.
+  const text = REQUIRED_SECTIONS
+    .map((section) => `${section}\n- ${section === '## Completed and Verified' ? '[verified] done' : '[fact] item'}\n`)
+    .join('\n')
+    + `${DO_NOT_REPEAT_SECTION}\n- [fact] item\n`
+  const verdict = validateSummary([{ type: 'text', text }], 20000)
   assert.equal(verdict.ok, false)
   assert.match(verdict.reason, /without a leading evidence marker/)
 })
@@ -251,4 +271,76 @@ test('non-text blocks are ignored when measuring input size', () => {
   }
   assert.equal(inputChars(input), 8)
   assert.equal(inputChars({}), 0)
+})
+
+// --- v2.2: span budget, marker repair, and length governance ---------------
+
+test('estimateTokens charges CJK text close to one token per character', () => {
+  // Latin: ~4 chars/token. A pure length/4 rule would badly under-count the
+  // Chinese summaries that the engine then rejects for being too large.
+  assert.equal(estimateTokens('abcd'), 1)
+  assert.equal(estimateTokens('abcdefgh'), 2)
+  const cjk = '工作区里已经完成的修复共三项'
+  assert.equal(estimateTokens(cjk), cjk.length)
+  // Mixed text: CJK counted per character, Latin at a quarter.
+  assert.equal(estimateTokens('修复 ok'), 2 + 1)
+})
+
+test('spanSize reports the shadowed span in characters and tokens', () => {
+  const input = {
+    messages: [
+      { content: [{ type: 'text', text: 'abcd' }, { text: 'efgh' }] },
+      { content: [{ type: 'text', text: 'ijklmnop' }] },
+    ],
+  }
+  assert.deepEqual(spanSize(input), { chars: 16, tokens: 4 })
+  assert.deepEqual(spanSize({}), { chars: 0, tokens: 0 })
+})
+
+test('canonicalizeSummary repairs alias markers and doubled markers', () => {
+  const text = [
+    '## Primary Request and Intent',
+    '- [verified] shipped the fix',
+    '- [fact] [fact] doubled marker',
+    '- [claimed] unproven thing',
+    '## Do Not Repeat',
+    '- [fact] do not rewrite docs/report.md',
+  ].join('\n')
+  const out = canonicalizeSummary(text)
+  assert.match(out, /- \[unverified\] shipped the fix/)
+  assert.match(out, /- \[fact\] doubled marker/)
+  assert.match(out, /- \[unverified\] unproven thing/)
+  assert.doesNotMatch(out, /\[verified\]|\[claimed\]/)
+})
+
+test('canonicalizeSummary leaves prose and fenced blocks untouched', () => {
+  const text = [
+    '## Critical Context',
+    'A paragraph, not a bullet at all.',
+    '```',
+    '- [verified] inside a fence stays verbatim',
+    '```',
+  ].join('\n')
+  const out = canonicalizeSummary(text)
+  assert.equal(out, text)
+})
+
+test('canonicalizeSummary never invents structure for a bullet-less body', () => {
+  const text = '## Next Step\nbare prose with no marker'
+  assert.equal(canonicalizeSummary(text), text)
+})
+
+test('the instruction carries a length budget only when one is supplied', () => {
+  const plain = buildInstruction(false)
+  assert.doesNotMatch(plain, /LENGTH BUDGET/)
+  const budgeted = buildInstruction(false, { budgetChars: 4000 })
+  assert.match(budgeted, /LENGTH BUDGET: keep the whole checkpoint under 4000 characters/)
+  const strict = buildInstruction(true, { budgetChars: 2400 })
+  assert.match(strict, /must stay under 2400 characters/)
+})
+
+test('the retry pass teaches the exact empty-placeholder form', () => {
+  // The dominant real-world format rejection was "- [fact] (none)" / "(none)"
+  // in a key-adjacent shape: the strict pass must spell the accepted form out.
+  assert.match(buildInstruction(true), /A section with nothing to record takes exactly "\(none\)"/)
 })

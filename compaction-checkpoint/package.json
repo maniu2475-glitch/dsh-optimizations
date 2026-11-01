@@ -1,10 +1,14 @@
 {
   "name": "@local/dsh-compaction-checkpoint",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
-  "description": "Checkpoint upgrade for DSH auto-compaction: stricter validated summary template (verified results, failed attempts, evidence markers, superseded requirements, do-not-repeat).",
+  "description": "Checkpoint upgrade for DSH auto-compaction: stricter validated summary template (verified results, failed attempts, evidence markers, superseded requirements, do-not-repeat), with span-size budgeting so a checkpoint can never grow past the content it replaces.",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/validate.test.js test/runtime.test.js",
+    "repro": "node test/repro-volume-gap.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./template": "./template.js"
